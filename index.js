@@ -17,7 +17,11 @@ const DATA_FILE = path.join(__dirname, "events.json");
 const TZ = "Asia/Tokyo";
 
 // ====== Slack (Bolt) ======
-const receiver = new ExpressReceiver({
+const receiver = new ExpressReceiver({receiver.app.use((req, _res, next) => {
+  console.log("REQ", req.method, req.path);
+  next();
+});
+
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   // Slash Commands の Request URL を .../slack/commands にしている前提
   endpoints: {

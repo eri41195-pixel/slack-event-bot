@@ -5,30 +5,24 @@ const { App, ExpressReceiver } = require("@slack/bolt");
 // ====== Config ======
 const PORT = process.env.PORT || 3000;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
-
-if (!process.env.SLACK_BOT_TOKEN) {
-  console.error("❌ SLACK_BOT_TOKEN is missing");
-}
-if (!process.env.SLACK_SIGNING_SECRET) {
-  console.error("❌ SLACK_SIGNING_SECRET is missing");
-}
-
-const DATA_FILE = path.join(__dirname, "events.json");
 const TZ = "Asia/Tokyo";
+const DATA_FILE = path.join(__dirname, "events.json");
 
 // ====== Slack (Bolt) ======
-const receiver = new ExpressReceiver({receiver.app.use((req, _res, next) => {
-  console.log("REQ", req.method, req.path);
-  next();
-});
-
+const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  // Slash Commands の Request URL を .../slack/commands にしている前提
   endpoints: {
     commands: "/slack/commands",
   },
 });
 
+// ✅ ここは receiver 作成の「後」に書く（構文エラー防止）
+receiver.app.use((req, _res, next) => {
+  console.log("REQ", req.method, req.path);
+  next();
+});
+
+// health check
 receiver.app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const app = new App({
@@ -71,11 +65,14 @@ function formatJst(isoString) {
     hour12: false,
   }).formatToParts(d);
 
-  const get = (type) => parts.find((p) => p.type === type)?.value;
+  const get = (type) => {
+    const p = parts.find((x) => x.type === type);
+    return p ? p.value : "";
+  };
+
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
-// JSTの「いま」を "YYYY-MM-DD HH:mm" で返す（サーバーTZに依存しない）
 function nowKeyJst() {
   const parts = new Intl.DateTimeFormat("ja-JP", {
     timeZone: TZ,
@@ -86,19 +83,26 @@ function nowKeyJst() {
     minute: "2-digit",
     hour12: false,
   }).formatToParts(new Date());
-  const get = (type) => parts.find((p) => p.type === type)?.value;
+
+  const get = (type) => {
+    const p = parts.find((x) => x.type === type);
+    return p ? p.value : "";
+  };
+
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
-// 入力: YYYY-MM-DD + HH:mm を JST として ISO にする（サーバーTZに依存しない）
 function parseJstToIso(dateStr, timeStr) {
-  // 例: 2026-01-12 20:27
-  // JST(+09:00)固定として ISO文字列化
+  // JST(+09:00)固定。サーバーのTZに依存しない
   return `${dateStr}T${timeStr}:00+09:00`;
 }
 
 function nextId(events) {
-  const max = events.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0);
+  let max = 0;
+  for (const e of events) {
+    const n = Number(e.id);
+    if (!Number.isNaN(n)) max = Math.max(max, n);
+  }
   return max + 1;
 }
 
@@ -117,7 +121,7 @@ function helpText() {
 
 // ====== Slash Command: /event ======
 app.command("/event", async ({ command, ack, respond }) => {
-  // Slackの3秒制限があるので、先に必ずackする
+  // Slackは3秒制限があるので、先にack
   await ack();
 
   const text = (command.text || "").trim();
@@ -126,17 +130,18 @@ app.command("/event", async ({ command, ack, respond }) => {
     return;
   }
 
-  const [sub, ...rest] = text.split(/\s+/);
+  const tokens = text.split(/\s+/);
+  const sub = tokens[0];
 
   if (sub === "add") {
-    // /event add YYYY-MM-DD HH:mm タイトル...
-    if (rest.length < 3) {
+    if (tokens.length < 4) {
       await respond("❌ 形式が違います。\n" + helpText());
       return;
     }
-    const dateStr = rest[0];
-    const timeStr = rest[1];
-    const title = rest.slice(2).join(" ");
+
+    const dateStr = tokens[1];
+    const timeStr = tokens[2];
+    const title = tokens.slice(3).join(" ");
 
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^\d{2}:\d{2}$/.test(timeStr)) {
       await respond("❌ 日付/時刻の形式が違います（YYYY-MM-DD / HH:mm）。\n" + helpText());
@@ -154,6 +159,7 @@ app.command("/event", async ({ command, ack, respond }) => {
       title,
       notified: false,
     });
+
     saveEvents(events);
 
     await respond(`登録しました ✅ ID=${id}\n${formatJst(isoJst)}  ${title}`);
@@ -161,7 +167,10 @@ app.command("/event", async ({ command, ack, respond }) => {
   }
 
   if (sub === "list") {
-    const events = loadEvents().slice().sort((a, b) => (a.isoJst > b.isoJst ? 1 : -1));
+    const events = loadEvents()
+      .slice()
+      .sort((a, b) => (a.isoJst > b.isoJst ? 1 : -1));
+
     if (events.length === 0) {
       await respond("イベントはありません。");
       return;
@@ -176,18 +185,23 @@ app.command("/event", async ({ command, ack, respond }) => {
   }
 
   if (sub === "remove" || sub === "delete") {
-    const idStr = rest[0];
-    const id = Number(idStr);
-    if (!idStr || Number.isNaN(id)) {
+    if (tokens.length < 2) {
       await respond("❌ remove の形式が違います。\n例: /event remove 3");
       return;
     }
+
+    const id = Number(tokens[1]);
+    if (Number.isNaN(id)) {
+      await respond("❌ ID は数字で指定してください。\n例: /event remove 3");
+      return;
+    }
+
     const events = loadEvents();
     const before = events.length;
-    const afterEvents = events.filter((e) => Number(e.id) !== id);
-    saveEvents(afterEvents);
+    const after = events.filter((e) => Number(e.id) !== id);
+    saveEvents(after);
 
-    if (afterEvents.length === before) {
+    if (after.length === before) {
       await respond(`⚠️ ID=${id} は見つかりませんでした。`);
     } else {
       await respond(`削除しました ✅ ID=${id}`);
@@ -199,13 +213,13 @@ app.command("/event", async ({ command, ack, respond }) => {
 });
 
 // ====== Reminder loop ======
-async function tryPostReminder(event) {
-  const msg = `⏰ リマインド\n${formatJst(event.isoJst)}  ${event.title}`;
-
+async function postReminder(event) {
   if (!TARGET_CHANNEL_ID) {
     console.warn("⚠️ TARGET_CHANNEL_ID is not set. Auto reminder is disabled.");
     return { ok: false, error: "TARGET_CHANNEL_ID not set" };
   }
+
+  const msg = `⏰ リマインド\n${formatJst(event.isoJst)}  ${event.title}`;
 
   try {
     await app.client.chat.postMessage({
@@ -215,27 +229,23 @@ async function tryPostReminder(event) {
     console.log("Posted reminder:", msg);
     return { ok: true };
   } catch (e) {
-    console.error("Failed to post reminder:", e?.data?.error || e);
-    return { ok: false, error: e?.data?.error || String(e) };
+    const err = e && e.data && e.data.error ? e.data.error : String(e);
+    console.error("Failed to post reminder:", err);
+    return { ok: false, error: err };
   }
 }
 
-function eventKeyJst(isoJst) {
-  // ISO(固定+09:00)を Date にして、JST表示キーにする
-  return formatJst(isoJst);
-}
-
 async function tick() {
-  const nowKey = nowKeyJst(); // "YYYY-MM-DD HH:mm" JST
+  const nowKey = nowKeyJst(); // "YYYY-MM-DD HH:mm" (JST)
   const events = loadEvents();
-
   let changed = false;
 
   for (const e of events) {
     if (e.notified) continue;
-    const ek = eventKeyJst(e.isoJst);
+
+    const ek = formatJst(e.isoJst); // JST固定の "YYYY-MM-DD HH:mm"
     if (ek === nowKey) {
-      const r = await tryPostReminder(e);
+      const r = await postReminder(e);
       if (r.ok) {
         e.notified = true;
         changed = true;
@@ -246,7 +256,7 @@ async function tick() {
   if (changed) saveEvents(events);
 }
 
-// 30秒ごとにチェック（分単位運用なら十分）
+// 30秒ごとにチェック（分単位運用OK）
 setInterval(() => {
   tick().catch((e) => console.error("tick error:", e));
 }, 30 * 1000);
